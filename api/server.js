@@ -1710,22 +1710,16 @@ app.put('/api/workout-plans/reorder', authenticateToken, async (req, res) => {
 
 //const server = http.createServer(app);
 //const wss = new WebSocket.Server({ server });
-const fs = require('fs');
-const https = require('https');
 const httpServer = http.createServer(app);
+
 httpServer.listen(80, '0.0.0.0', () => {
     console.log('✅ HTTP сервер: http://0.0.0.0:80');
 });
 
-const httpsOptions = {
-    key: fs.readFileSync('/app/server.key'),
-    cert: fs.readFileSync('/app/server.crt'),
-};
-const httpsServer = https.createServer(httpsOptions, app);
-httpsServer.listen(443, '0.0.0.0', () => {
-    console.log('✅ HTTPS сервер: https://0.0.0.0:443');
-});
-const wss = new WebSocket.Server({ server: httpsServer });
+// WebSocket работает через тот же HTTP-сервер.
+// HTTPS здесь не запускаем, потому что server.key и server.crt
+// в проекте отсутствуют.
+const wss = new WebSocket.Server({ server: httpServer });
 wss.on('connection', (ws) => {
     console.log('📱 Новое WebSocket подключение');
     
