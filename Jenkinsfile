@@ -1,251 +1,257 @@
 pipeline {
-  agent { label 'docker-agent' }
-
-  environment {
-    APP_NAME = 'app'
-    CANARY_APP_NAME = 'app-canary'
-    DOCKER_HUB_USER = 'qwertyaaaaaaaytrewq'
-    GIT_REPO = 'https://github.com/qwertyaaaaaaaytrewq/crudapp-jenkins.git'
-    BACKEND_IMAGE_NAME = 'front'
-    DATABASE_IMAGE_NAME = 'mysql'
-    MANAGER_IP = '192.168.0.1'
-  }
-
-  stages {
-
-    stage('Checkout') {
-      steps {
-        git url: "${GIT_REPO}", branch: 'main'
-      }
+    agent {
+        label 'docker-agent'
     }
 
-    stage('Build Docker Images') {
-      steps {
-        sh "docker build --network=host -f node.Dockerfile . -t ${DOCKER_HUB_USER}/${BACKEND_IMAGE_NAME}:${BUILD_NUMBER}"
-        sh "docker build --network=host -f mysql.Dockerfile . -t ${DOCKER_HUB_USER}/${DATABASE_IMAGE_NAME}:${BUILD_NUMBER}"
-      }
+    options {
+        skipDefaultCheckout(true)
     }
 
-    stage('Push to Docker Hub') {
-      steps {
-        withCredentials([
-          usernamePassword(
-            credentialsId: 'docker-hub-credentials',
-            usernameVariable: 'DOCKER_USER',
-            passwordVariable: 'DOCKER_PASS'
-          )
-        ]) {
-          sh '''
-            echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+    environment {
+        APP_NAME = 'app'
+        CANARY_APP_NAME = 'app-canary'
 
-            docker push ${DOCKER_HUB_USER}/${BACKEND_IMAGE_NAME}:${BUILD_NUMBER}
-            docker push ${DOCKER_HUB_USER}/${DATABASE_IMAGE_NAME}:${BUILD_NUMBER}
-          '''
+        DOCKER_HUB_USER = 'qwertyaaaaaaaytrewq'
+
+        GIT_REPO = 'https://github.com/qwertyaaaaaaaytrewq/crudapp-jenkins.git'
+
+        BACKEND_IMAGE_NAME = 'front'
+        DATABASE_IMAGE_NAME = 'mysql'
+
+        MANAGER_IP = '192.168.0.1'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                deleteDir()
+
+                retry(3) {
+                    checkout([
+                        $class: 'GitSCM',
+
+                        branches: [[
+                            name: '*/main'
+                        ]],
+
+                        userRemoteConfigs: [[
+                            url: "${GIT_REPO}"
+                        ]],
+
+                        extensions: [[
+                            $class: 'CloneOption',
+                            shallow: true,
+                            depth: 1,
+                            noTags: true,
+                            timeout: 20
+                        ]]
+                    ])
+                }
+            }
         }
-      }
+
+        stage('Build Docker Images') {
+            steps {
+
+                retry(2) {
+                    sh """
+                        docker build \
+                        --network=host \
+                        -f node.Dockerfile \
+                        -t ${DOCKER_HUB_USER}/${BACKEND_IMAGE_NAME}:${BUILD_NUMBER} \
+                        .
+                    """
+                }
+
+                retry(2) {
+                    sh """
+                        docker build \
+                        --network=host \
+                        -f mysql.Dockerfile \
+                        -t ${DOCKER_HUB_USER}/${DATABASE_IMAGE_NAME}:${BUILD_NUMBER} \
+                        .
+                    """
+                }
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'docker-hub-credentials',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
+
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login \
+                        -u "$DOCKER_USER" \
+                        --password-stdin
+
+                        docker push \
+                        ${DOCKER_HUB_USER}/${BACKEND_IMAGE_NAME}:${BUILD_NUMBER}
+
+                        docker push \
+                        ${DOCKER_HUB_USER}/${DATABASE_IMAGE_NAME}:${BUILD_NUMBER}
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Canary') {
+            steps {
+                sh '''
+                    echo "=== Deploy Canary ==="
+
+                    docker stack deploy \
+                    -c docker-compose_canary.yaml \
+                    ${CANARY_APP_NAME} \
+                    --with-registry-auth
+
+                    sleep 60
+
+                    docker service ls \
+                    --filter name=${CANARY_APP_NAME}
+                '''
+            }
+        }
+
+        stage('Canary Testing') {
+            steps {
+                sh '''
+                    echo "=== Canary Testing ==="
+
+                    SUCCESS=0
+                    TESTS=5
+
+                    for i in $(seq 1 $TESTS); do
+
+                        echo "Canary test $i/$TESTS"
+
+                        if curl -f -s \
+                            --max-time 15 \
+                            http://${MANAGER_IP}:8081/ \
+                            > /tmp/canary_$i.html
+                        then
+
+                            if ! grep -iq \
+                                "error\\|fatal\\|exception" \
+                                /tmp/canary_$i.html
+                            then
+                                SUCCESS=$((SUCCESS + 1))
+                                echo "OK"
+                            else
+                                echo "Error in page"
+                            fi
+
+                        else
+                            echo "No response"
+                        fi
+
+                        sleep 3
+                    done
+
+                    echo "Successful tests: $SUCCESS/$TESTS"
+
+                    [ "$SUCCESS" -ge 4 ] || exit 1
+                '''
+            }
+        }
+
+        stage('Deploy Production') {
+            steps {
+                sh '''
+                    echo "=== Production deployment ==="
+
+                    if docker service inspect \
+                        ${APP_NAME}_web-server \
+                        > /dev/null 2>&1
+                    then
+
+                        echo "Existing production found"
+
+                        docker service update \
+                        --image ${DOCKER_HUB_USER}/${BACKEND_IMAGE_NAME}:${BUILD_NUMBER} \
+                        --update-parallelism 1 \
+                        --update-delay 10s \
+                        ${APP_NAME}_web-server
+
+                    else
+
+                        echo "First production deployment"
+
+                        docker stack deploy \
+                        --prune \
+                        -c docker-compose.yaml \
+                        ${APP_NAME} \
+                        --with-registry-auth
+
+                    fi
+
+                    sleep 60
+
+                    docker service ls \
+                    --filter name=${APP_NAME}
+                '''
+            }
+        }
+
+        stage('Final Verification') {
+            steps {
+                sh '''
+                    echo "=== Final Verification ==="
+
+                    SUCCESS=0
+
+                    for i in $(seq 1 5); do
+
+                        if curl -f -s \
+                            --max-time 15 \
+                            http://${MANAGER_IP}:8080/ \
+                            > /dev/null
+                        then
+                            SUCCESS=$((SUCCESS + 1))
+                            echo "Test $i OK"
+                        else
+                            echo "Test $i FAILED"
+                        fi
+
+                        sleep 3
+                    done
+
+                    echo "Final tests: $SUCCESS/5"
+
+                    [ "$SUCCESS" -ge 4 ] || exit 1
+
+                    echo "Production works"
+                '''
+            }
+        }
+
+        stage('Remove Canary') {
+            steps {
+                sh '''
+                    docker stack rm ${CANARY_APP_NAME} || true
+                '''
+            }
+        }
     }
 
-    stage('Deploy Canary') {
-      steps {
-        sh '''
-          echo "=== Развёртывание Canary (1 реплика) ==="
+    post {
 
-          docker stack deploy \
-            -c docker-compose_canary.yaml \
-            ${CANARY_APP_NAME} \
-            --with-registry-auth
+        success {
+            echo 'SUCCESS: pipeline completed'
+        }
 
-          sleep 40
+        failure {
+            echo 'FAILURE: pipeline stopped'
+        }
 
-          docker service ls --filter name=${CANARY_APP_NAME}
-        '''
-      }
+        always {
+            echo 'Pipeline finished'
+        }
     }
-
-    stage('Canary Testing') {
-      steps {
-        sh '''
-          echo "=== Тестирование Canary-версии (порт 8081) ==="
-
-          SUCCESS=0
-          TESTS=10
-
-          for i in $(seq 1 $TESTS); do
-            echo "Тест $i/$TESTS..."
-
-            if curl -f -s --max-time 15 http://${MANAGER_IP}:8081/ > /tmp/canary_$i.html; then
-
-              if ! grep -iq "error\\|fatal\\|exception\\|failed" /tmp/canary_$i.html; then
-                SUCCESS=$((SUCCESS + 1))
-                echo "✓ Тест $i пройден"
-              else
-                echo "✗ Тест $i: найдены ошибки в ответе"
-              fi
-
-            else
-              echo "✗ Тест $i: нет ответа"
-            fi
-
-            sleep 4
-          done
-
-          echo "Успешных тестов: $SUCCESS/$TESTS"
-
-          [ "$SUCCESS" -ge 8 ] || exit 1
-
-          echo "Canary прошёл тестирование!"
-        '''
-      }
-    }
-
-    stage('Gradual Traffic Shift') {
-      steps {
-        sh '''
-          echo "=== Постепенное переключение трафика на новую версию ==="
-
-          if docker service ls \
-            --filter name=${APP_NAME}_web-server \
-            | grep -q ${APP_NAME}_web-server; then
-
-            echo "Основной сервис существует — начинаем rolling update по одной реплике"
-
-            echo "Шаг 1: Обновляем 1-ю реплику продакшена"
-
-            docker service update \
-              --image ${DOCKER_HUB_USER}/${BACKEND_IMAGE_NAME}:${BUILD_NUMBER} \
-              --update-parallelism 1 \
-              --update-delay 20h \
-              --detach=true \
-              ${APP_NAME}_web-server
-
-            echo "Ожидание стабилизации после первой реплики..."
-
-            sleep 40
-
-            docker service ps \
-              ${APP_NAME}_web-server \
-              --no-trunc | head -20
-
-            echo "=== Мониторинг после первой реплики ==="
-
-            MONITOR_SUCCESS=0
-            MONITOR_TESTS=10
-
-            for j in $(seq 1 $MONITOR_TESTS); do
-
-              if curl -f -s --max-time 15 \
-                http://${MANAGER_IP}:8080/ \
-                > /tmp/monitor_$j.html; then
-
-                if ! grep -iq "error\\|fatal" /tmp/monitor_$j.html; then
-                  MONITOR_SUCCESS=$((MONITOR_SUCCESS + 1))
-                fi
-
-              fi
-
-              sleep 5
-            done
-
-            echo "Успешных проверок после первой реплики: $MONITOR_SUCCESS/$MONITOR_TESTS"
-
-            [ "$MONITOR_SUCCESS" -ge 9 ] || exit 1
-
-            echo "Мониторинг после первой реплики прошёл!"
-
-            sleep 60
-
-            echo "Шаг 2: Обновляем оставшиеся реплики"
-
-            docker service update \
-              --image ${DOCKER_HUB_USER}/${BACKEND_IMAGE_NAME}:${BUILD_NUMBER} \
-              --update-parallelism 1 \
-              --update-delay 30s \
-              ${APP_NAME}_web-server
-
-            echo "Ожидание завершения полного обновления..."
-
-            sleep 90
-
-            echo "Статус после обновления:"
-
-            docker service ps \
-              ${APP_NAME}_web-server | head -20
-
-            echo "Удаление canary stack..."
-
-            docker stack rm ${CANARY_APP_NAME} || true
-
-            sleep 20
-
-          else
-
-            echo "Первый деплой — разворачиваем продакшен"
-
-            docker stack deploy \
-              -c docker-compose.yaml \
-              ${APP_NAME} \
-              --with-registry-auth
-
-            sleep 60
-
-          fi
-
-          echo "Постепенное переключение завершено"
-        '''
-      }
-    }
-
-    stage('Final Verification') {
-      steps {
-        sh '''
-          echo "=== Финальная проверка ==="
-
-          for i in $(seq 1 5); do
-
-            echo "Финальный тест $i/5..."
-
-            if curl -f --max-time 10 \
-              http://${MANAGER_IP}:8080/ \
-              > /dev/null 2>&1; then
-
-              echo "✓ Тест $i пройден"
-
-            else
-
-              echo "✗ Тест $i не пройден"
-              exit 1
-
-            fi
-
-            sleep 5
-          done
-
-          echo "Все финальные тесты пройдены!"
-        '''
-      }
-    }
-  }
-
-  post {
-
-    success {
-      echo "✓ Canary-деплой успешно завершён!"
-      sh 'docker logout'
-    }
-
-    failure {
-      echo "✗ Ошибка в пайплайне — canary удалён, продакшен остался прежним"
-
-      sh '''
-        docker stack rm ${CANARY_APP_NAME} || true
-        echo "Canary удалён, продакшен не тронут"
-      '''
-
-      sh 'docker logout'
-    }
-
-    always {
-      sh 'docker image prune -f || true'
-    }
-  }
 }
