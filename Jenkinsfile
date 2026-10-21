@@ -13,6 +13,9 @@ pipeline {
 
         MANAGER_IP = '192.168.0.1'
 
+        MYSQL_ROOT_PASSWORD = '1'
+        MYSQL_DATABASE = 'db'
+
         DOCKER_HOST = 'tcp://192.168.0.1:2376'
         DOCKER_BUILDKIT = '1'
     }
@@ -73,6 +76,8 @@ pipeline {
         stage('Deploy Canary') {
             steps {
                 sh '''
+                    echo "=== Развёртывание Canary ==="
+
                     docker stack deploy \
                         -c docker-compose_canary.yaml \
                         ${CANARY_APP_NAME} \
@@ -80,7 +85,8 @@ pipeline {
 
                     sleep 40
 
-                    docker service ls
+                    docker service ls \
+                        --filter name=${CANARY_APP_NAME}
                 '''
             }
         }
@@ -88,6 +94,8 @@ pipeline {
         stage('Canary Testing') {
             steps {
                 sh '''
+                    echo "=== Проверка Canary-приложения ==="
+
                     SUCCESS=0
 
                     for i in $(seq 1 10)
@@ -111,9 +119,122 @@ pipeline {
             }
         }
 
+        stage('Database Validation') {
+            steps {
+                sh '''
+                    echo "======================================"
+                    echo "Проверка структуры базы данных"
+                    echo "Таблица: profiles"
+                    echo "Поле: allergies"
+                    echo "Ожидаемый тип: TEXT"
+                    echo "======================================"
+
+                    DB_SERVICE="${CANARY_APP_NAME}_db"
+
+                    echo "Определяем ноду, на которой запущена Canary-БД..."
+
+                    DB_NODE=$(docker service ps \
+                        --filter desired-state=running \
+                        --format '{{.Node}}' \
+                        "$DB_SERVICE" | head -1)
+
+                    if [ -z "$DB_NODE" ]; then
+                        echo "ERROR: не найдена нода с Canary-БД"
+                        exit 1
+                    fi
+
+                    echo "База запущена на ноде: $DB_NODE"
+
+                    DB_NODE_IP=$(docker node inspect \
+                        "$DB_NODE" \
+                        --format '{{.Status.Addr}}')
+
+                    if [ -z "$DB_NODE_IP" ]; then
+                        echo "ERROR: не удалось определить IP ноды"
+                        exit 1
+                    fi
+
+                    echo "IP ноды: $DB_NODE_IP"
+
+                    echo "Ожидание готовности контейнера MySQL..."
+
+                    READY=0
+                    DB_CONTAINER=""
+
+                    for i in $(seq 1 30)
+                    do
+                        DB_CONTAINER=$(docker \
+                            -H tcp://${DB_NODE_IP}:2376 \
+                            ps \
+                            --filter "name=${CANARY_APP_NAME}_db" \
+                            --format '{{.ID}}' | head -1)
+
+                        if [ -n "$DB_CONTAINER" ]; then
+
+                            if docker \
+                                -H tcp://${DB_NODE_IP}:2376 \
+                                exec "$DB_CONTAINER" \
+                                mysqladmin ping \
+                                -uroot \
+                                -p"${MYSQL_ROOT_PASSWORD}" \
+                                --silent
+                            then
+                                READY=1
+                                echo "MySQL готов"
+                                break
+                            fi
+                        fi
+
+                        echo "Попытка $i/30..."
+                        sleep 3
+                    done
+
+                    if [ "$READY" -ne 1 ]; then
+                        echo "ERROR: MySQL не запустился"
+                        exit 1
+                    fi
+
+                    echo "Проверяем тип profiles.allergies..."
+
+                    FIELD_TYPE=$(docker \
+                        -H tcp://${DB_NODE_IP}:2376 \
+                        exec "$DB_CONTAINER" \
+                        mysql \
+                        -uroot \
+                        -p"${MYSQL_ROOT_PASSWORD}" \
+                        -D "${MYSQL_DATABASE}" \
+                        -Nse "
+                            SELECT LOWER(DATA_TYPE)
+                            FROM INFORMATION_SCHEMA.COLUMNS
+                            WHERE TABLE_SCHEMA='${MYSQL_DATABASE}'
+                              AND TABLE_NAME='profiles'
+                              AND COLUMN_NAME='allergies';
+                        " 2>/dev/null | tr -d '\\r\\n ')
+
+                    echo "Найден тип поля allergies: [$FIELD_TYPE]"
+
+                    if [ "$FIELD_TYPE" = "text" ]; then
+                        echo "======================================"
+                        echo "DATABASE VALIDATION: SUCCESS"
+                        echo "profiles.allergies имеет тип TEXT"
+                        echo "======================================"
+                    else
+                        echo "======================================"
+                        echo "DATABASE VALIDATION: FAILED"
+                        echo "Ожидался тип TEXT"
+                        echo "Получен тип: $FIELD_TYPE"
+                        echo "======================================"
+                        exit 1
+                    fi
+                '''
+            }
+        }
+
         stage('Deploy Production') {
             steps {
                 sh '''
+                    echo "=== Развёртывание Production ==="
+
                     docker stack deploy \
                         -c docker-compose.yaml \
                         ${APP_NAME} \
@@ -129,6 +250,8 @@ pipeline {
         stage('Final Verification') {
             steps {
                 sh '''
+                    echo "=== Финальная проверка ==="
+
                     SUCCESS=0
 
                     for i in $(seq 1 5)
@@ -162,16 +285,27 @@ pipeline {
     }
 
     post {
-        always {
-            echo 'Pipeline finished.'
-        }
 
         success {
             echo 'SUCCESS: Pipeline completed.'
+
+            sh '''
+                docker logout || true
+            '''
         }
 
         failure {
             echo 'FAILURE: Pipeline stopped.'
+
+            sh '''
+                echo "Удаляем тестовую Canary-версию..."
+                docker stack rm ${CANARY_APP_NAME} || true
+                docker logout || true
+            '''
+        }
+
+        always {
+            echo 'Pipeline finished.'
         }
     }
 }
